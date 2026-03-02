@@ -1,5 +1,11 @@
+###############################################################
+# main.tf — Root configuration
+# Calls all modules and wires them together
+###############################################################
+
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.5.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -7,32 +13,87 @@ terraform {
     }
   }
 
-  # Store state in S3 (remote backend)
+  # S3 backend — stores Terraform state remotely
   backend "s3" {
-    bucket         = "skincare-tfstate-yourname"  # Create this bucket first!
-    key            = "terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "terraform-locks"
+    bucket         = "bb-sat-tf-state"
+    key            = "skincare-pipeline/terraform.tfstate"
+    region         = "eu-central-1"
+    dynamodb_table = "bb-sat-tf-state-lock"
+    encrypt        = true
   }
 }
 
-# Configure AWS Provider
 provider "aws" {
   region = var.aws_region
-
-  # Use your IAM credentials from aws configure
-  # Or set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 }
 
-# S3 Module (Buckets first!)
+###############################################################
+# Modules
+###############################################################
+
+module "iam" {
+  source      = "./modules/iam"
+  project     = var.project
+  environment = var.environment
+  bucket_name = var.pipeline_bucket_name
+  account_id  = var.account_id
+}
+
 module "s3" {
-  source = "./modules/s3"
-
-  bucket_name   = var.bucket_name
-  project_name  = var.project_name
+  source      = "./modules/s3"
+  project     = var.project
+  environment = var.environment
+  bucket_name = var.pipeline_bucket_name
+  aws_region  = var.aws_region
+  account_id  = var.account_id
 }
 
-# Outputs (visible after terraform apply)
-output "s3_bucket_name" {
-  value = module.s3.bucket_name
+module "dynamodb" {
+  source      = "./modules/dynamodb"
+  project     = var.project
+  environment = var.environment
+}
+
+module "glue" {
+  source            = "./modules/glue"
+  project           = var.project
+  environment       = var.environment
+  bucket_name       = var.pipeline_bucket_name
+  glue_role_arn     = module.iam.glue_role_arn
+}
+
+module "lambda" {
+  source              = "./modules/lambda"
+  project             = var.project
+  environment         = var.environment
+  bucket_name         = var.pipeline_bucket_name
+  lambda_role_arn     = module.iam.lambda_role_arn
+  dynamodb_table_name = module.dynamodb.table_name
+}
+
+module "sns" {
+  source            = "./modules/sns"
+  project           = var.project
+  environment       = var.environment
+  alert_email       = var.alert_email
+}
+
+module "step_functions" {
+  source                = "./modules/step_functions"
+  project               = var.project
+  environment           = var.environment
+  glue_job_name         = module.glue.job_name
+  lambda_similarity_arn = module.lambda.similarity_function_arn
+  lambda_loader_arn     = module.lambda.loader_function_arn
+  sns_topic_arn         = module.sns.topic_arn
+  step_functions_role_arn = module.iam.step_functions_role_arn
+}
+
+module "eventbridge" {
+  source               = "./modules/eventbridge"
+  project              = var.project
+  environment          = var.environment
+  bucket_name          = var.pipeline_bucket_name
+  state_machine_arn    = module.step_functions.state_machine_arn
+  eventbridge_role_arn = module.iam.eventbridge_role_arn
 }
