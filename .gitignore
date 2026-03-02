@@ -1,0 +1,45 @@
+# Terraform
+.terraform/
+.terraform/modules/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfplan
+*.tfplan.binary
+
+# Terraform variables (sensitive data)
+terraform.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
+override.tf.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Data (not committing real data)
+data/*.csv
+!data/*.csv.example
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
