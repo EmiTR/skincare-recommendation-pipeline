@@ -25,8 +25,8 @@ from botocore.exceptions import NoCredentialsError, ClientError
 # ---------------------------------------------------------------------------
 # Configuration — update BUCKET_NAME before running
 # ---------------------------------------------------------------------------
-BUCKET_NAME = "your-pipeline-bucket-name"   # ← change this to your actual bucket name
-AWS_REGION  = "eu-central-1"                # ← change if you use a different region
+BUCKET_NAME = "beauty-boba-sip-and-tint"   # our actual bucket name
+AWS_REGION  = "eu-central-1"                # ← change if you use a different region. Default = eu-central-1 
 
 # Local file paths → S3 bronze layer destination keys
 FILES = {
