@@ -3,32 +3,24 @@ bronze_to_silver.py
 ===================
 AWS Glue ETL job — Bronze to Silver layer transformation
 
-What this script does:
-1. Reads raw CSVs from S3 bronze layer (raw/)
-2. Cleans and normalizes Flaconi product + ingredients data
-3. Cleans and normalizes DM product + ingredients data
-4. Joins Flaconi product info with ingredients on 'url' (inner join)
-5. Validates data quality — stops pipeline via SNS if missing ingredients found
-6. Writes cleaned data to S3 silver layer (cleaned/)
-
-Triggered by: AWS Step Functions (called from state machine)
-Output: cleaned/flaconi/flaconi_cleaned.csv, cleaned/dm/dm_cleaned.csv
+Output schema (both tables):
+  product_id, source, brand, product_name, price_eur,
+  url, ingredient, position
 """
 
 import sys
 import re
 import boto3
-from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, FloatType
+from pyspark.sql.types import (
+    StringType, FloatType, IntegerType,
+    ArrayType, StructType, StructField
+)
 
-# ---------------------------------------------------------------------------
-# Initialize Glue context
-# ---------------------------------------------------------------------------
 args = getResolvedOptions(sys.argv, [
     "JOB_NAME",
     "SOURCE_BUCKET",
@@ -45,60 +37,84 @@ spark       = glueContext.spark_session
 job         = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-BUCKET                    = args["SOURCE_BUCKET"]
-SOURCE_FLACONI_PRODUCTS   = f"s3://{BUCKET}/{args['SOURCE_FLACONI_PRODUCTS']}"
-SOURCE_FLACONI_INGREDIENTS = f"s3://{BUCKET}/{args['SOURCE_FLACONI_INGREDIENTS']}"
-SOURCE_DM                 = f"s3://{BUCKET}/{args['SOURCE_DM']}"
-TARGET_FLACONI            = f"s3://{BUCKET}/{args['TARGET_FLACONI']}"
-TARGET_DM                 = f"s3://{BUCKET}/{args['TARGET_DM']}"
+BUCKET                     = args["SOURCE_BUCKET"]
+SOURCE_FLACONI_PRODUCTS    = "s3://{}/{}".format(BUCKET, args["SOURCE_FLACONI_PRODUCTS"])
+SOURCE_FLACONI_INGREDIENTS = "s3://{}/{}".format(BUCKET, args["SOURCE_FLACONI_INGREDIENTS"])
+SOURCE_DM                  = "s3://{}/{}".format(BUCKET, args["SOURCE_DM"])
+TARGET_FLACONI             = "s3://{}/{}".format(BUCKET, args["TARGET_FLACONI"])
+TARGET_DM                  = "s3://{}/{}".format(BUCKET, args["TARGET_DM"])
 
-# SNS topic for pipeline failure alerts
-SNS_TOPIC_ARN = f"arn:aws:sns:eu-central-1:{boto3.client('sts').get_caller_identity()['Account']}:beauty-boba-dev-pipeline-alerts"
+ACCOUNT_ID    = boto3.client("sts").get_caller_identity()["Account"]
+SNS_TOPIC_ARN = "arn:aws:sns:eu-central-1:{}:beauty-boba-dev-pipeline-alerts".format(ACCOUNT_ID)
 
-print(f"✅ Glue job initialized: {args['JOB_NAME']}")
-print(f"   Source bucket : {BUCKET}")
-print(f"   Flaconi prods : {SOURCE_FLACONI_PRODUCTS}")
-print(f"   Flaconi ings  : {SOURCE_FLACONI_INGREDIENTS}")
-print(f"   DM data       : {SOURCE_DM}")
-
+print("Glue job initialized: {}".format(args["JOB_NAME"]))
 
 # ---------------------------------------------------------------------------
-# Helper: Send SNS alert and stop pipeline
+# Synonyms and footnote patterns
 # ---------------------------------------------------------------------------
-def alert_and_fail(message: str):
-    """Publish failure message to SNS and raise exception to stop the job."""
-    print(f"❌ PIPELINE FAILURE: {message}")
+SYNONYMS = {
+    "WATER":                    "AQUA",
+    "EAU":                      "AQUA",
+    "AQUA/WATER":               "AQUA",
+    "WATER/AQUA":               "AQUA",
+    "AQUA/WATER/EAU":           "AQUA",
+    "WATER/AQUA/EAU":           "AQUA",
+    "DEIONIZED WATER":          "AQUA",
+    "PURIFIED WATER":           "AQUA",
+    "DISTILLED WATER":          "AQUA",
+    "WATERAQUAEAU":             "AQUA",
+    "WASSERAQUAEAU":            "AQUA",
+    "AQUA (WATER)":             "AQUA",
+    "WATER (AQUA)":             "AQUA",
+    "WATER (AQUA/EAU)":         "AQUA",
+    "AQUA (WATER/EAU)":         "AQUA",
+    "AQUA/[WATER]":             "AQUA",
+    "AQUA [WATER]":             "AQUA",
+    "WATER [AQUA]":             "AQUA",
+    "WATER/EAU (AQUA)":         "AQUA",
+}
+
+FOOTNOTE_PATTERNS = [
+    r"^[\*\.\-\d\s]+$",
+    r"HERGESTELLT",
+    r"ATHERISCH",
+    r"BIO-ZUTAT",
+    r"NATURLICH",
+    r"EXCLUSIVE.*COMPLEX",
+    r"^[A-Z]+'S\s",
+    r"PPM\)?$",
+    r"PPB\)?$",
+    r"^\d+\s*%$",
+    r"^\d+PPM",
+    r"^\d+\s",
+]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def alert_and_fail(message):
+    print("PIPELINE FAILURE: {}".format(message))
     try:
         sns = boto3.client("sns", region_name="eu-central-1")
         sns.publish(
             TopicArn=SNS_TOPIC_ARN,
-            Subject="❌ Beauty Boba Pipeline Failure — Glue ETL",
-            Message=f"The Glue ETL job failed with the following error:\n\n{message}\n\nJob: {args['JOB_NAME']}"
+            Subject="Beauty Boba Pipeline Failure - Glue ETL",
+            Message="Glue ETL job failed:\n\n{}\n\nJob: {}\nBucket: {}".format(
+                message, args["JOB_NAME"], BUCKET)
         )
-        print("📧 SNS alert sent successfully.")
-    except Exception as sns_error:
-        print(f"⚠️  Could not send SNS alert: {sns_error}")
-    raise Exception(f"Pipeline stopped: {message}")
+    except Exception as e:
+        print("Could not send SNS alert: {}".format(e))
+    raise Exception("Pipeline stopped: {}".format(message))
 
 
-# ---------------------------------------------------------------------------
-# Helper: Clean price string → float
-# Handles: "18,90 €", "ab 16,78 €", "UVP 29,95 €", None
-# ---------------------------------------------------------------------------
-def clean_price(price_str: str):
+def clean_price(price_str):
     if price_str is None:
         return None
-    # Remove "ab", "UVP", "€", spaces — keep digits, commas, dots
-    cleaned = re.sub(r"[^\d,\.]", " ", price_str).strip()
-    # Take the first number found (handles "ab 16,78" → "16,78")
+    cleaned = re.sub(r"[^\d,\.]", " ", str(price_str)).strip()
     match = re.search(r"[\d]+[,\.][\d]+", cleaned)
     if match:
-        number = match.group().replace(",", ".")
         try:
-            return float(number)
+            return float(match.group().replace(",", "."))
         except ValueError:
             return None
     return None
@@ -106,227 +122,229 @@ def clean_price(price_str: str):
 clean_price_udf = F.udf(clean_price, FloatType())
 
 
-# ---------------------------------------------------------------------------
-# Helper: Normalize ingredients string
-# Steps:
-#   1. Strip "Ingredients:" prefix (DM data)
-#   2. Lowercase everything
-#   3. Standardize water/aqua variants → "aqua"
-#   4. Split on comma → list
-#   5. Strip whitespace from each ingredient
-#   6. Remove special characters (dots, asterisks)
-#   7. Remove empty strings and duplicates
-#   8. Rejoin as clean comma-separated string
-# ---------------------------------------------------------------------------
-def normalize_ingredients(raw: str):
-    if raw is None or str(raw).strip() == "":
-        return None
+def protect_chemical_commas(s):
+    return re.sub(r"(\d),(\d)", r"\1CHEMCOMMA\2", s)
 
-    text = str(raw).strip()
+def restore_chemical_commas(s):
+    return s.replace("CHEMCOMMA", ",")
 
-    # Step 1: Strip "Ingredients:" prefix
-    text = re.sub(r"^ingredients\s*:\s*", "", text, flags=re.IGNORECASE)
+def apply_synonyms(ing):
+    return SYNONYMS.get(ing.strip(), ing.strip())
 
-    # Step 2: Lowercase
-    text = text.lower()
-
-    # Step 3: Standardize water/aqua variants
-    water_variants = [
-        r"water\\aqua\\eau",
-        r"aqua\s*/\s*water",
-        r"water\s*\(aqua\/eau\)",
-        r"water\(aqua\/eau\)",
-        r"water\s*\(aqua\)",
-        r"aqua\s*/\s*water\s*/\s*eau",
-        r"water\/aqua\/eau",
-        r"water\\\\aqua\\\\eau",
-        r"\bwater\b",
-        r"\beau\b",
+def strip_ingredients_prefix(s):
+    patterns = [
+        r"^ingredients\s*[/:;,]?\s*inci\s*:\s*",
+        r"^ingredients\s*/[^:]+:\s*",
+        r"^ingredients\s*[/:;]\s*",
+        r"^ingredients\s*:\s*",
+        r"^ingredients\s+",
+        r"^inci\s*:\s*",
+        r"^inci\s+",
     ]
-    for pattern in water_variants:
-        text = re.sub(pattern, "aqua", text, flags=re.IGNORECASE)
+    for pattern in patterns:
+        s = re.sub(pattern, "", s, flags=re.IGNORECASE).strip()
+    return s
 
-    # Step 4: Split on comma
-    parts = text.split(",")
+def clean_ingredient_string(raw):
+    if raw is None or str(raw).strip() == "":
+        return ""
+    s = str(raw)
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = strip_ingredients_prefix(s)
+    s = re.sub(r"\(Aqua[^)]*\)",  "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\(Water[^)]*\)", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\(Eau[^)]*\)",   "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*[|]\s*",  ",", s)
+    s = re.sub(r"\s*[*]\s*",  ",", s)
+    s = re.sub(r"\s*[\u00b7]\s*", ",", s)
+    s = re.sub(r"\s*[\u2022]\s*", ",", s)
+    s = re.sub(r"\s*[.]\s*",  ",", s)
+    s = s.rstrip(".")
+    s = protect_chemical_commas(s)
+    s = s.upper()
+    return s.strip()
 
-    # Step 5-6: Strip whitespace and special characters from each ingredient
-    cleaned_parts = []
-    for part in parts:
-        part = part.strip()
-        part = re.sub(r"[.\*\[\]\(\)]", "", part).strip()
-        if part:
-            cleaned_parts.append(part)
-
-    # Step 7: Remove duplicates while preserving order
-    seen = set()
-    unique_parts = []
-    for part in cleaned_parts:
-        if part not in seen:
-            seen.add(part)
-            unique_parts.append(part)
-
-    if not unique_parts:
-        return None
-
-    # Step 8: Rejoin as clean string
-    return ", ".join(unique_parts)
-
-normalize_ingredients_udf = F.udf(normalize_ingredients, StringType())
+def clean_single_ingredient(ing):
+    ing = ing.strip()
+    if "/" in ing:
+        ing = ing.split("/")[0].strip()
+    if "\\" in ing:
+        ing = ing.split("\\")[0].strip()
+    ing = re.sub(r"\s*\([^)]*\)", "", ing).strip()
+    ing = re.sub(r"\s+\d+\.?\d*\s*%", "", ing).strip()
+    ing = re.sub(r"^\*+", "", ing).strip()
+    ing = re.sub(r"\*+$", "", ing).strip()
+    ing = restore_chemical_commas(ing)
+    ing_check = ing.replace("A","A").replace("O","O").replace("U","U")
+    for pattern in FOOTNOTE_PATTERNS:
+        if re.search(pattern, ing_check, re.IGNORECASE):
+            return ""
+    ing = apply_synonyms(ing)
+    return ing.strip()
 
 
 # ---------------------------------------------------------------------------
-# SECTION 1: Process Flaconi data
+# PySpark UDF: explode ingredient string -> array of (ingredient, position)
 # ---------------------------------------------------------------------------
-print("\n📂 Reading Flaconi data from S3 bronze layer...")
+ingredient_schema = ArrayType(
+    StructType([
+        StructField("ingredient", StringType(), True),
+        StructField("position",   IntegerType(), True),
+    ])
+)
 
-# Read products file (semicolon-separated)
+def explode_ingredient_string(raw_string):
+    if not raw_string:
+        return []
+    cleaned_string = clean_ingredient_string(raw_string)
+    if not cleaned_string:
+        return []
+    seen     = set()
+    position = 1
+    result   = []
+    for token in cleaned_string.split(","):
+        ing = clean_single_ingredient(token)
+        if len(ing) < 3:
+            continue
+        if re.match(r"^CI\s+\d+$", ing):
+            continue
+        if not ing:
+            continue
+        if ing in seen:
+            continue
+        seen.add(ing)
+        result.append({"ingredient": ing, "position": position})
+        position += 1
+    return result
+
+explode_ingredients_udf = F.udf(explode_ingredient_string, ingredient_schema)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 1: Flaconi
+# ---------------------------------------------------------------------------
+print("Reading Flaconi bronze layer...")
+
 df_products = spark.read.csv(
-    SOURCE_FLACONI_PRODUCTS,
-    header=True,
-    sep=";",
-    encoding="UTF-8"
+    SOURCE_FLACONI_PRODUCTS, header=True, sep=";", encoding="UTF-8"
 )
-
-# Read ingredients file (comma-separated)
 df_ingredients = spark.read.csv(
-    SOURCE_FLACONI_INGREDIENTS,
-    header=True,
-    sep=",",
-    encoding="UTF-8"
+    SOURCE_FLACONI_INGREDIENTS, header=True, sep=",", encoding="UTF-8"
 )
 
-print(f"   Flaconi products   : {df_products.count()} rows")
-print(f"   Flaconi ingredients: {df_ingredients.count()} rows")
+print("  Flaconi products   : {}".format(df_products.count()))
+print("  Flaconi ingredients: {}".format(df_ingredients.count()))
 
-# --- Clean Flaconi products ---
-print("\n🧹 Cleaning Flaconi product data...")
 df_products_clean = df_products.select(
+    F.trim(F.col("url")).alias("url"),
     F.trim(F.col("brand")).alias("brand"),
     F.trim(F.col("series")).alias("product_name"),
-    F.trim(F.col("product_type")).alias("product_type"),
-    F.trim(F.col("url")).alias("url"),
     clean_price_udf(F.col("price")).alias("price_eur"),
-    clean_price_udf(F.col("uvp_price")).alias("uvp_price_eur"),
-)
+).filter(F.col("url").isNotNull())
 
-# Drop rows with null URL (needed for join)
-df_products_clean = df_products_clean.filter(F.col("url").isNotNull())
-
-# --- Clean Flaconi ingredients ---
-print("🧹 Cleaning Flaconi ingredients data...")
 df_ingredients_clean = df_ingredients.select(
     F.trim(F.col("url")).alias("url"),
-    normalize_ingredients_udf(F.col("ingredients")).alias("ingredients_clean"),
+    F.trim(F.col("ingredients")).alias("ingredients_raw"),
+).filter(F.col("url").isNotNull())
+
+print("Joining Flaconi products with ingredients...")
+df_flaconi = df_products_clean.join(df_ingredients_clean, on="url", how="inner")
+print("  After join: {}".format(df_flaconi.count()))
+
+# Filter out missing ingredients (scraper noise ~3-4% expected)
+missing_flaconi = df_flaconi.filter(
+    F.col("ingredients_raw").isNull() | (F.trim(F.col("ingredients_raw")) == "")
+).count()
+if missing_flaconi > 0:
+    print("Dropping {} Flaconi products with missing ingredients (scraper noise).".format(missing_flaconi))
+df_flaconi = df_flaconi.filter(
+    F.col("ingredients_raw").isNotNull() & (F.trim(F.col("ingredients_raw")) != "")
 )
 
-# --- Inner join on URL ---
-print("🔗 Joining Flaconi products with ingredients on URL (inner join)...")
-df_flaconi = df_products_clean.join(df_ingredients_clean, on="url", how="inner")
+df_flaconi = df_flaconi \
+    .withColumn("product_id", F.concat_ws("_", F.lit("flaconi"),
+                F.monotonically_increasing_id().cast(StringType()))) \
+    .withColumn("source", F.lit("flaconi"))
 
-print(f"   After join: {df_flaconi.count()} rows")
+print("Exploding Flaconi ingredients...")
+df_flaconi = df_flaconi \
+    .withColumn("ing_array",  explode_ingredients_udf(F.col("ingredients_raw"))) \
+    .withColumn("ing_struct", F.explode(F.col("ing_array"))) \
+    .withColumn("ingredient", F.col("ing_struct.ingredient")) \
+    .withColumn("position",   F.col("ing_struct.position")) \
+    .select("product_id", "source", "brand", "product_name",
+            "price_eur", "url", "ingredient", "position")
 
-# --- Data quality check: missing ingredients ---
-missing_ingredients = df_flaconi.filter(
-    F.col("ingredients_clean").isNull() | (F.col("ingredients_clean") == "")
-).count()
-
-print(f"   Products with missing ingredients: {missing_ingredients}")
-
-if missing_ingredients > 0:
-    alert_and_fail(
-        f"Data quality check failed: {missing_ingredients} Flaconi products have missing or empty "
-        f"ingredients after cleaning. Please check the source data in s3://{BUCKET}/raw/flaconi/ "
-        f"and re-run the pipeline."
-    )
-
-# Add source column for traceability
-df_flaconi = df_flaconi.withColumn("source", F.lit("flaconi"))
-
-print(f"✅ Flaconi silver layer ready: {df_flaconi.count()} products")
-df_flaconi.printSchema()
+print("Flaconi silver ready: {} ingredient rows".format(df_flaconi.count()))
+print("  Unique products   : {}".format(df_flaconi.select("product_id").distinct().count()))
+print("  Unique ingredients: {}".format(df_flaconi.select("ingredient").distinct().count()))
 
 
 # ---------------------------------------------------------------------------
-# SECTION 2: Process DM data
+# SECTION 2: DM
 # ---------------------------------------------------------------------------
-print("\n📂 Reading DM data from S3 bronze layer...")
+print("Reading DM bronze layer...")
 
 df_dm_raw = spark.read.csv(
-    SOURCE_DM,
-    header=True,
-    sep=",",
-    encoding="UTF-8"
+    SOURCE_DM, header=True, sep=",", encoding="UTF-8"
 )
+print("  DM raw rows: {}".format(df_dm_raw.count()))
 
-print(f"   DM raw rows: {df_dm_raw.count()}")
-
-# --- Select and rename relevant columns only ---
-print("🧹 Cleaning DM product data...")
 df_dm = df_dm_raw.select(
     F.trim(F.col("product_url")).alias("url"),
     F.trim(F.col("brand")).alias("brand"),
     F.trim(F.col("product_name")).alias("product_name"),
     clean_price_udf(F.col("price")).alias("price_eur"),
-    F.trim(F.col("subcategory")).alias("product_type"),
-    normalize_ingredients_udf(F.col("ingredients")).alias("ingredients_clean"),
-    # Keep rating for potential future use in recommendations
+    F.trim(F.col("ingredients")).alias("ingredients_raw"),
     F.col("rating_search").cast(FloatType()).alias("rating"),
     F.col("review_count_search").alias("review_count"),
+).filter(F.col("url").isNotNull())
+
+# Filter out missing ingredients
+missing_dm = df_dm.filter(
+    F.col("ingredients_raw").isNull() | (F.trim(F.col("ingredients_raw")) == "")
+).count()
+if missing_dm > 0:
+    print("Dropping {} DM products with missing ingredients (scraper noise).".format(missing_dm))
+df_dm = df_dm.filter(
+    F.col("ingredients_raw").isNotNull() & (F.trim(F.col("ingredients_raw")) != "")
 )
 
-# Drop rows with null URL
-df_dm = df_dm.filter(F.col("url").isNotNull())
+df_dm = df_dm \
+    .withColumn("product_id", F.concat_ws("_", F.lit("dm"),
+                F.monotonically_increasing_id().cast(StringType()))) \
+    .withColumn("source", F.lit("dm"))
 
-# --- Data quality check: missing ingredients ---
-missing_dm = df_dm.filter(
-    F.col("ingredients_clean").isNull() | (F.col("ingredients_clean") == "")
-).count()
+print("Exploding DM ingredients...")
+df_dm = df_dm \
+    .withColumn("ing_array",  explode_ingredients_udf(F.col("ingredients_raw"))) \
+    .withColumn("ing_struct", F.explode(F.col("ing_array"))) \
+    .withColumn("ingredient", F.col("ing_struct.ingredient")) \
+    .withColumn("position",   F.col("ing_struct.position")) \
+    .select("product_id", "source", "brand", "product_name",
+            "price_eur", "url", "ingredient", "position")
 
-print(f"   DM products with missing ingredients: {missing_dm}")
-
-if missing_dm > 0:
-    alert_and_fail(
-        f"Data quality check failed: {missing_dm} DM products have missing or empty ingredients "
-        f"after cleaning. Please check the source data in s3://{BUCKET}/raw/dm/ "
-        f"and re-run the pipeline."
-    )
-
-# Add source column
-df_dm = df_dm.withColumn("source", F.lit("dm"))
-
-print(f"✅ DM silver layer ready: {df_dm.count()} products")
-df_dm.printSchema()
+print("DM silver ready: {} ingredient rows".format(df_dm.count()))
+print("  Unique products   : {}".format(df_dm.select("product_id").distinct().count()))
+print("  Unique ingredients: {}".format(df_dm.select("ingredient").distinct().count()))
 
 
 # ---------------------------------------------------------------------------
-# SECTION 3: Final validation summary
+# SECTION 3: Write silver layer
 # ---------------------------------------------------------------------------
-print("\n📊 Silver Layer Summary")
-print("=" * 50)
-print(f"  Flaconi products : {df_flaconi.count()}")
-print(f"  DM products      : {df_dm.count()}")
-print(f"  Flaconi columns  : {df_flaconi.columns}")
-print(f"  DM columns       : {df_dm.columns}")
+print("Silver Layer Summary")
+print("  Flaconi ingredient rows : {}".format(df_flaconi.count()))
+print("  DM ingredient rows      : {}".format(df_dm.count()))
 
-# Sample output for verification
-print("\n🔍 Flaconi sample (first 3 rows):")
-df_flaconi.select("brand", "product_name", "price_eur", "ingredients_clean").show(3, truncate=80)
-
-print("\n🔍 DM sample (first 3 rows):")
-df_dm.select("brand", "product_name", "price_eur", "ingredients_clean").show(3, truncate=80)
-
-
-# ---------------------------------------------------------------------------
-# SECTION 4: Write silver layer to S3
-# ---------------------------------------------------------------------------
-print(f"\n💾 Writing Flaconi silver layer to {TARGET_FLACONI}...")
+print("Writing Flaconi silver to {}...".format(TARGET_FLACONI))
 df_flaconi.coalesce(1).write.mode("overwrite").option("header", "true").csv(TARGET_FLACONI)
 
-print(f"💾 Writing DM silver layer to {TARGET_DM}...")
+print("Writing DM silver to {}...".format(TARGET_DM))
 df_dm.coalesce(1).write.mode("overwrite").option("header", "true").csv(TARGET_DM)
 
-print("\n✅ Bronze to Silver ETL complete!")
-print(f"   → {TARGET_FLACONI}")
-print(f"   → {TARGET_DM}")
+print("Bronze to Silver ETL complete!")
+print("  -> {}".format(TARGET_FLACONI))
+print("  -> {}".format(TARGET_DM))
 
 job.commit()
