@@ -1,0 +1,75 @@
+name: Build and Deploy Lambda Images
+
+on:
+  push:
+    branches:
+      - feature/docker-airflow
+    paths:
+      - 'docker/**'
+      - 'lambda/**/handler.py'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Check out the code ────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Configure AWS credentials ────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # ── Step 3: Log in to ECR ─────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Step 4: Copy handler files into Docker build context ──────────────
+      - name: Copy handler files
+        run: |
+          cp lambda/similarity/handler.py docker/similarity/handler.py
+          cp lambda/loader/handler.py docker/loader/handler.py
+
+      # ── Step 5: Build and push similarity image ───────────────────────────
+      - name: Build and push similarity image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-similarity:latest \
+            docker/similarity/
+
+          docker push \
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-similarity:latest
+
+      # ── Step 6: Build and push loader image ──────────────────────────────
+      - name: Build and push loader image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-loader:latest \
+            docker/loader/
+
+          docker push \
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-loader:latest
+
+      # ── Step 7: Update Lambda functions to use new images ─────────────────
+      - name: Update similarity Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name beauty-boba-dev-similarity \
+            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-similarity:latest \
+            --region eu-central-1
+
+      - name: Update loader Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name beauty-boba-dev-loader \
+            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/beauty-boba-loader:latest \
+            --region eu-central-1
